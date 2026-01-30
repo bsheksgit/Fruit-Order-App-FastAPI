@@ -1,5 +1,6 @@
 from typing import Optional
 import json
+import os
 
 from bson.objectid import ObjectId
 from fastapi import FastAPI
@@ -7,6 +8,8 @@ from fastapi.responses import HTMLResponse
 import uvicorn
 from pydantic import BaseModel
 from pymongo import MongoClient
+
+from tasks import reset_inventory_data
 
 
 # Configuring FastAPI application
@@ -29,14 +32,22 @@ class OrderRequest(BaseModel):
     delivery_type: str  # e.g., "standard", "express"
     comments: Optional[str] = None
 
+class InventoryItem(BaseModel):
+    fruit: Fruit
+    quantity: int
+    last_updated: str  # ISO format date string
+
 # MongoDB connection setup
-client = MongoClient("mongodb://localhost:27017/")
+client = MongoClient(os.getenv("MONGODB_URL", "mongodb://localhost:27017/"))
 db = client["fruit_supply_db"]
 fruits_collection = db["fruits"]
 orders_collection = db["orders"]
+inventory_collection = db["inventory"]
 
 #Defining DB constraints
-fruits_collection.create_index("name", unique=True)
+@proj.on_event("startup")
+async def startup_event():
+    fruits_collection.create_index("name", unique=True)
 
 # Writing API endpoints
 @proj.get("/", response_class=HTMLResponse)
@@ -182,6 +193,84 @@ def delete_order(order_id: str):
         return {"message": "Order deleted successfully"}
     except Exception as e:
         return {"error": f"Error occurred while deleting order: {str(e)}"}
+
+# Inventory endpoints for inventory_collection
+@proj.post("/add_inventory")
+def add_inventory(item: InventoryItem):
+    """
+    A POST endpoint to add a new inventory item to the database.
+    """
+    item_dict = json.loads(item.json())
+    try:
+        result = inventory_collection.insert_one(item_dict)
+        return {"message": "Inventory item added successfully", "inventory_id": str(result.inserted_id)}
+    except Exception as e:
+        return {"error": f"Error occurred while adding inventory item: {str(e)}"}
+
+@proj.get("/get_inventory/{inventory_id}")
+def get_inventory(inventory_id: str):
+    """
+    A GET endpoint to retrieve a specific inventory item by ID.
+    """
+    try:
+        item = inventory_collection.find_one({"_id": ObjectId(inventory_id)})
+        if not item:
+            return {"error": "Inventory item not found"}
+        item["_id"] = str(item["_id"]) 
+        return {"inventory_item": item}
+    except Exception as e:
+        return {"error": f"Error occurred while retrieving inventory item: {str(e)}"}
+
+@proj.put("/update_inventory/{inventory_id}")
+def update_inventory(inventory_id: str, item: InventoryItem):
+    """
+    A PUT endpoint to update/replace an existing inventory item by ID.
+    """
+    item_dict = json.loads(item.json())
+    try:
+        result = inventory_collection.update_one(
+            {"_id": ObjectId(inventory_id)},
+            {"$set": item_dict}
+        )
+        if result.matched_count == 0:
+            return {"error": "Inventory item not found"}
+        return {"message": "Inventory item updated successfully"}
+    except Exception as e:
+        return {"error": f"Error occurred while updating inventory item: {str(e)}"}
+
+@proj.patch("/update_inventory_quantity/{inventory_id}")
+def update_inventory_quantity(inventory_id: str, new_quantity: int):
+    """
+    A PATCH endpoint to update only the quantity of an inventory item by ID.
+    """
+    try:
+        result = inventory_collection.update_one(
+            {"_id": ObjectId(inventory_id)},
+            {"$set": {"quantity": new_quantity}}
+        )
+        if result.matched_count == 0:
+            return {"error": "Inventory item not found"}
+        return {"message": "Inventory quantity updated successfully"}
+    except Exception as e:
+        return {"error": f"Error occurred while updating inventory quantity: {str(e)}"}
+
+@proj.delete("/delete_inventory/{inventory_id}")
+def delete_inventory(inventory_id: str):
+    """
+    A DELETE endpoint to delete a specific inventory item by ID.
+    """
+    try:
+        result = inventory_collection.delete_one({"_id": ObjectId(inventory_id)})
+        if result.deleted_count == 0:
+            return {"error": "Inventory item not found"}
+        return {"message": "Inventory item deleted successfully"}
+    except Exception as e:
+        return {"error": f"Error occurred while deleting inventory item: {str(e)}"}
+
+@proj.post("/trigger-inventory-reset")
+def trigger_inventory_reset(inventory_id: str, new_quantity: int):
+    task = reset_inventory_data.delay(inventory_id, new_quantity)
+    return {"task_id": task.id}
 
 if __name__ == "__main__":
     uvicorn.run(proj, host="localhost", port=8000)
